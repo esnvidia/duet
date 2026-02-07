@@ -1,6 +1,8 @@
 # duet
 
-Autonomous pair programming for AI coding agents. Two agents work side-by-side in tmux — one implements, the other reviews — iterating until they reach consensus. One shell script, zero dependencies.
+Autonomous pair programming for AI coding agents. Two agents work side-by-side in tmux — one implements, the other reviews — iterating until they reach consensus. 
+
+**One shell script, zero dependencies**.
 
 
 
