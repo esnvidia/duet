@@ -36,6 +36,10 @@ set -euo pipefail
 #   --turn-timeout SECS        Max seconds per agent turn (default: 3600 / 1hr).
 #   --stall-timeout SECS       Seconds before declaring agent stuck (default: 600).
 #                              For long jobs (training, batch), set high or 0.
+#   --idle-grace SECS          Replace pane idle-detection with a fixed sleep
+#                              after each turn (default: 3). Set to 0 to use
+#                              pane idle-detection instead (watches for screen
+#                              to stop changing — can hang if CLI has spinners).
 #   --clear                    Remove the .bridge/ directory and exit. Use to
 #                              start fresh (clears all sessions).
 #
@@ -63,6 +67,9 @@ AUTO_APPROVE=false
 SECURE_MODE=false
 EXPLORE_MODE=false
 SESSION="pair"
+TURN_TIMEOUT=3600             # max seconds per agent turn (1 hour)
+STALL_TIMEOUT=600             # seconds before declaring an agent stuck (10 min)
+IDLE_GRACE=3                  # 0 = pane idle-detection; >0 = sleep N seconds instead
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -73,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --secure)           SECURE_MODE=true; shift ;;
         --turn-timeout)     TURN_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout)    STALL_TIMEOUT="$2"; shift 2 ;;
+        --idle-grace)       IDLE_GRACE="$2"; shift 2 ;;
         --explore|-e)       EXPLORE_MODE=true; shift ;;
         --clear)
             echo "Clearing .bridge/ directory..."
@@ -107,8 +115,6 @@ AGENT_B_CONFIG=$(agent_config_file "$AGENT_B_CMD")
 
 POLL_INTERVAL=1               # seconds between idle-checks
 IDLE_CHECKS=3                 # consecutive unchanged checks = done
-TURN_TIMEOUT=3600             # max seconds per agent turn (1 hour)
-STALL_TIMEOUT=600             # seconds before declaring an agent stuck (10 min)
 OBSERVE_INTERVAL=45           # seconds between live-scrutiny snapshots
 FIRST_OBSERVE_DELAY=60        # seconds before first observation (allow extended thinking)
 ERROR_PATIENCE=1              # transient error cycles to tolerate before interject
@@ -134,7 +140,7 @@ err()   { echo -e "${C_ERR}[$(stamp)] [ERROR]${C_RESET} $*" >&2; }
 
 # --- Platform helpers --------------------------------------------------------
 file_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
 pane_hash() {
@@ -227,10 +233,10 @@ tokens_report() {
 
 # --- Auto-approve system -----------------------------------------------------
 # Safe commands: non-destructive, read-only or benign operations
-SAFE_CMD_PATTERN='^(ls|ll|la|dir|tree|pwd|du|df|cat|head|tail|wc|sort|uniq|diff|file|stat|mkdir|cd|chmod|chown|echo|printf|which|type|env|export|find|grep|rg|sleep|pytest|py\.test|node|ruby|perl|git[[:space:]]+(status|log|diff|branch|show|tag)|pip[[:space:]]+(list|show|install)|npm[[:space:]]+(list|ls|test|install|run)|yarn[[:space:]](list|test|install|run)|cargo[[:space:]]+(build|test|check|clippy|run)|docker[[:space:]]+(run|exec|build|ps|logs|images|compose)|docker-compose|python|python3)([[:space:]]|$)'
+SAFE_CMD_PATTERN='^(ls|ll|la|dir|tree|pwd|du|df|cat|head|tail|wc|sort|uniq|diff|file|stat|mkdir|cd|chmod|chown|echo|printf|which|type|env|export|find|grep|rg|sed|awk|sleep|ps|touch|tee|date|nvidia-smi|nvcc|nsys|ncu|pytest|py\.test|node|ruby|perl|git[[:space:]]+(status|log|diff|branch|show|tag|add|commit|stash)|pip[[:space:]]+(list|show|install)|pip3[[:space:]]+(list|show|install)|npm[[:space:]]+(list|ls|test|install|run)|yarn[[:space:]](list|test|install|run)|cargo[[:space:]]+(build|test|check|clippy|run)|docker[[:space:]]+(run|exec|build|ps|logs|images|compose)|docker-compose|torchrun|python|python3|mamba[[:space:]]+(install|list|create|env)|conda[[:space:]]+(install|list|create|env))([[:space:]]|$)'
 
 # --secure mode: tighter safe list (no bare python/node, no find, no chmod/chown)
-SAFE_CMD_PATTERN_SECURE='^(ls|ll|la|dir|tree|pwd|du|df|cat|head|tail|wc|sort|uniq|diff|file|stat|mkdir|cd|echo|printf|which|type|env|export|grep|rg|sleep|pytest|py\.test|git[[:space:]]+(status|log|diff|branch|show|tag)|pip[[:space:]]+(list|show)|npm[[:space:]]+(list|ls|test)|yarn[[:space:]](list|test)|cargo[[:space:]]+(build|test|check|clippy)|python[[:space:]]+-m|python3[[:space:]]+-m)([[:space:]]|$)'
+SAFE_CMD_PATTERN_SECURE='^(ls|ll|la|dir|tree|pwd|du|df|cat|head|tail|wc|sort|uniq|diff|file|stat|mkdir|cd|echo|printf|which|type|env|export|grep|rg|sleep|ps|touch|date|nvidia-smi|pytest|py\.test|git[[:space:]]+(status|log|diff|branch|show|tag)|pip[[:space:]]+(list|show)|npm[[:space:]]+(list|ls|test)|yarn[[:space:]](list|test)|cargo[[:space:]]+(build|test|check|clippy)|python[[:space:]]+-m|python3[[:space:]]+-m)([[:space:]]|$)'
 
 # Always blocked — never auto-approve these regardless of mode
 BLOCKED_CMD_PATTERN='^(rm|rmdir|sudo|git[[:space:]]+(push|reset|clean|checkout[[:space:]]+\.))'
@@ -238,8 +244,12 @@ BLOCKED_CMD_PATTERN='^(rm|rmdir|sudo|git[[:space:]]+(push|reset|clean|checkout[[
 # --secure mode: expanded block list
 BLOCKED_CMD_PATTERN_SECURE='^(rm|rmdir|sudo|dd|mv|chmod|chown|chattr|git[[:space:]]+(push|reset|clean|checkout[[:space:]]+\.))'
 
-# --secure mode: reject commands with dangerous operators (pipes, semicolons, etc.)
-DANGEROUS_OPERATORS='[;|`]|\$\(|&&'
+# Dangerous operators — reject commands containing these in auto-approve.
+# Catches: ; | ` $( && and file redirects (> >> but NOT 2> stderr redirect).
+# Checked in both modes: --secure rejects all, non-secure rejects only redirects
+# (to prevent printf/echo > file bypass after shell unwrapping).
+DANGEROUS_OPERATORS='[;|`]|\$\(|&&|[^2fd]>|^>'
+REDIRECT_OPERATORS='[^2fd]>|^>'
 
 # --secure mode: sensitive file paths — never auto-approve edits to these
 BLOCKED_EDIT_PATTERN='(\.ssh|\.gnupg|\.bash|\.zsh|\.profile|\.git/hooks|/etc/|/root/|\.env|credentials|secrets|authorized_keys|known_hosts|id_rsa|\.pem|\.key)'
@@ -299,9 +309,26 @@ should_auto_approve() {
         effective=$(echo "$effective" | sed 's/^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]*//')
     done
 
-    # --secure: reject commands with dangerous operators (pipes, semicolons, etc.)
+    # Strip absolute path prefix from command (e.g. /usr/bin/bash → bash)
+    effective=$(echo "$effective" | sed 's|^/[^ ]*/||')
+
+    # Unwrap shell wrappers: bash -c "cmd" / bash -lc "cmd" / sh -c "cmd"
+    # Codex commonly runs: /usr/bin/bash -lc "printf ..."
+    local inner
+    inner=$(echo "$effective" | sed -n "s/^\\(ba\\)\\{0,1\\}sh[[:space:]]\\{1,\\}-[a-z]*c[[:space:]]\\{1,\\}[\"']\\{0,1\\}\\(.*\\)/\\2/p" | sed "s/[\"']\\{0,1\\}$//")
+    if [[ -n "$inner" ]]; then
+        effective="$inner"
+    fi
+
+    # Always reject file redirects (prevents printf/echo > file bypass).
+    # In --secure mode, also reject pipes, semicolons, backticks, etc.
     if [[ "$SECURE_MODE" == "true" ]]; then
         if echo "$effective" | grep -qE "$DANGEROUS_OPERATORS"; then
+            return 1
+        fi
+    else
+        # Non-secure: still catch file redirects (> >>) to prevent file overwrites
+        if echo "$effective" | grep -qE "$REDIRECT_OPERATORS"; then
             return 1
         fi
     fi
@@ -329,6 +356,18 @@ should_auto_approve() {
     script_pattern=$(extract_script_pattern "$effective")
     if [[ -n "$script_pattern" && -f "$APPROVED_SCRIPTS_FILE" ]]; then
         if grep -qF "$script_pattern" "$APPROVED_SCRIPTS_FILE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # APPROVED COMMAND: bare command name listed in approved_scripts.txt
+    # Matches entries like "sed" or "awk" against the base command, allowing
+    # any arguments. This lets users pre-seed commands that don't follow the
+    # interpreter+script pattern.
+    if [[ -f "$APPROVED_SCRIPTS_FILE" ]]; then
+        local base_cmd
+        base_cmd=$(echo "$effective" | awk '{print $1}')
+        if grep -qxF "$base_cmd" "$APPROVED_SCRIPTS_FILE" 2>/dev/null; then
             return 0
         fi
     fi
@@ -382,27 +421,46 @@ detect_permission_prompt() {
     local lines
     lines=$(tmux capture-pane -t "$pane" -p -S -25 2>/dev/null || true)
 
+    # Guard: confirm this is a real interactive prompt, not agent discussion text.
+    # Accept ANY of these indicators (permissive — just need one structural signal):
+    #   - Selector character (❯ or ›) near a numbered option
+    #   - Numbered option list pattern ("1. Yes" / "2. No" at start of line)
+    #   - Claude Code's "shift+tab" hint (only appears in real prompts)
+    local has_prompt=false
+    if echo "$lines" | grep -qE '(❯|›)[[:space:]]*(1\.|Yes)'; then
+        has_prompt=true
+    elif echo "$lines" | grep -qE '^[[:space:]]*(❯|›)?[[:space:]]*(1\.[[:space:]]+(Yes|Allow)|2\.[[:space:]]+(Yes|No|Allow))'; then
+        has_prompt=true
+    elif echo "$lines" | grep -qi 'shift+tab'; then
+        has_prompt=true
+    fi
+
     # --- File create/edit prompt (Claude Code) ---
     # "Do you want to create converter.py?"
     # "Do you want to edit converter.py?"
     # "Do you want to make this edit to economy.py?"  (v2.1.34+)
-    local edit_file
-    edit_file=$(echo "$lines" | grep -oE 'Do you want to (create|edit|make this edit to) [^ ?]+' | tail -1 | awk '{print $NF}')
-    if [[ -n "$edit_file" ]]; then
-        echo "edit:$edit_file"
-        return
+    if [[ "$has_prompt" == "true" ]]; then
+        local edit_file
+        edit_file=$(echo "$lines" | grep -oE 'Do you want to (create|edit|make this edit to) [^ ?]+' | tail -1 | awk '{print $NF}')
+        if [[ -n "$edit_file" ]]; then
+            echo "edit:$edit_file"
+            return
+        fi
     fi
 
     # --- Bash command prompt (Claude Code) ---
     # Two known formats:
     #   v2.1.34+:  "Bash command\n  <cmd>\n  <desc>\n Permission rule..."
     #   older:     "Bash(<cmd>)\n ... Do you want to proceed?"
-    if echo "$lines" | grep -qE '(Do you want to proceed|Permission rule)'; then
+    if [[ "$has_prompt" == "true" ]] && echo "$lines" | grep -qE '(Do you want to proceed|Permission rule)'; then
         local cmd=""
 
-        # Format 1 (v2.1.34+): "Bash command" header, command on next indented line
+        # Format 1 (v2.1.34+): "Bash command" header, command on next indented line(s)
+        # Accumulate continuation lines (multi-line commands like nvidia-smi with
+        # long flags) instead of taking only the first line.
         if [[ -z "$cmd" ]] && echo "$lines" | grep -q 'Bash command'; then
             local found_header=false
+            local got_first_line=false
             while IFS= read -r line; do
                 if echo "$line" | grep -q 'Bash command'; then
                     found_header=true
@@ -412,10 +470,21 @@ detect_permission_prompt() {
                     local trimmed
                     trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
                     # Skip blank lines; stop at Permission rule / Do you want
-                    if [[ -z "$trimmed" ]]; then continue; fi
+                    if [[ -z "$trimmed" ]]; then
+                        # Blank line after first content line = end of command
+                        if [[ "$got_first_line" == "true" ]]; then break; fi
+                        continue
+                    fi
                     if echo "$trimmed" | grep -qE 'Permission rule|Do you want'; then break; fi
-                    cmd="$trimmed"
-                    break
+                    if [[ "$got_first_line" == "true" ]]; then
+                        # Continuation line: append with space
+                        cmd="$cmd $trimmed"
+                    else
+                        cmd="$trimmed"
+                        got_first_line=true
+                    fi
+                    # Safety: don't accumulate more than 4 lines
+                    if [[ ${#cmd} -gt 500 ]]; then break; fi
                 fi
             done <<< "$lines"
         fi
@@ -448,7 +517,7 @@ detect_permission_prompt() {
     #   › 1. Yes, proceed (y)
     #     2. Yes, and don't ask again for these files (a)
     #     3. No, and tell Codex what to do differently (esc)
-    if echo "$lines" | grep -qE 'Would you like to make the following edits'; then
+    if [[ "$has_prompt" == "true" ]] && echo "$lines" | grep -qE 'Would you like to make the following edits'; then
         local edit_file
         edit_file=$(echo "$lines" | grep -oE '[^[:space:]]+\.[a-zA-Z]+ \(\+[0-9]+ -[0-9]+\)' | tail -1 | awk '{print $1}')
         if [[ -n "$edit_file" ]]; then
@@ -471,7 +540,7 @@ detect_permission_prompt() {
     #
     # Returns "codex-bash:" so try_auto_approve can select option 2
     # ("don't ask again") via Down+Enter instead of plain Enter.
-    if echo "$lines" | grep -qE 'Would you like to run the following command'; then
+    if [[ "$has_prompt" == "true" ]] && echo "$lines" | grep -qE 'Would you like to run the following command'; then
         local cmd
         cmd=$(echo "$lines" | grep -E '^[[:space:]]*[$] ' | tail -1 | sed 's/^[[:space:]]*[$] //')
         if [[ -n "$cmd" ]]; then
@@ -556,19 +625,19 @@ try_auto_approve() {
             pane_text=$(tmux capture-pane -t "$pane" -p -S -15 2>/dev/null || true)
             if echo "$pane_text" | grep -qiE "(allow all edits|don't ask again)"; then
                 log "Auto-approving file edit for Agent $label: $prompt_value (allow all edits)"
-                tmux send-keys -t "$pane" Down
+                tmux send-keys -t "$pane" Down 2>/dev/null || true
                 sleep 0.1
-                tmux send-keys -t "$pane" Enter
+                tmux send-keys -t "$pane" Enter 2>/dev/null || true
             else
                 log "Auto-approving file edit for Agent $label: $prompt_value"
-                tmux send-keys -t "$pane" Enter
+                tmux send-keys -t "$pane" Enter 2>/dev/null || true
             fi
             sleep 0.2
             ;;
         bash)
             if should_auto_approve "$prompt_value"; then
                 log "Auto-approving bash for Agent $label: $prompt_value"
-                tmux send-keys -t "$pane" Enter
+                tmux send-keys -t "$pane" Enter 2>/dev/null || true
                 sleep 0.2
                 record_script_approval "$prompt_value"
             else
@@ -586,12 +655,12 @@ try_auto_approve() {
                 pane_text=$(tmux capture-pane -t "$pane" -p -S -15 2>/dev/null || true)
                 if echo "$pane_text" | grep -qi "don't ask again"; then
                     log "Auto-approving bash for Agent $label: $prompt_value (don't ask again)"
-                    tmux send-keys -t "$pane" Down
+                    tmux send-keys -t "$pane" Down 2>/dev/null || true
                     sleep 0.1
-                    tmux send-keys -t "$pane" Enter
+                    tmux send-keys -t "$pane" Enter 2>/dev/null || true
                 else
                     log "Auto-approving bash for Agent $label: $prompt_value"
-                    tmux send-keys -t "$pane" Enter
+                    tmux send-keys -t "$pane" Enter 2>/dev/null || true
                 fi
                 sleep 0.2
                 record_script_approval "$prompt_value"
@@ -608,6 +677,14 @@ try_auto_approve() {
 wait_for_idle() {
     local pane="$1"
     local label="${2:-agent}"
+
+    # Grace mode: skip pane idle-detection entirely. Useful for training
+    # workloads where CLI spinners keep the pane hash changing forever.
+    if [[ $IDLE_GRACE -gt 0 ]]; then
+        sleep "$IDLE_GRACE"
+        return 0
+    fi
+
     local prev="" idle=0 elapsed=0
 
     while [[ $elapsed -lt $TURN_TIMEOUT ]]; do
@@ -815,17 +892,17 @@ classify_errors() {
 instruct() {
     local pane="$1"; shift
     local msg="$*"
-    tmux send-keys -t "$pane" -l "$msg"
+    tmux send-keys -t "$pane" -l "$msg" 2>/dev/null || true
     sleep 0.3
-    tmux send-keys -t "$pane" Enter
+    tmux send-keys -t "$pane" Enter 2>/dev/null || true
 }
 
 # Interrupt an agent (Esc twice, like the user pressing Esc in Claude Code).
 interrupt_agent() {
     local pane="$1"
-    tmux send-keys -t "$pane" Escape
+    tmux send-keys -t "$pane" Escape 2>/dev/null || true
     sleep 1
-    tmux send-keys -t "$pane" Escape
+    tmux send-keys -t "$pane" Escape 2>/dev/null || true
     sleep 0.5
 }
 
@@ -1148,8 +1225,39 @@ monitor_turn() {
         (( elapsed += POLL_INTERVAL ))
     done
 
-    err "Timeout waiting for Agent $worker_label (file: $output_file)"
-    return 1
+    # Timeout: don't kill the session — nudge the agent to wrap up and reflect.
+    local timeout_mins=$((TURN_TIMEOUT / 60))
+    log_w "Turn timeout (${timeout_mins}m) for Agent $worker_label — nudging to wrap up"
+    interrupt_agent "$worker_pane"
+
+    local output_basename
+    output_basename=$(basename "$output_file")
+    instruct "$worker_pane" \
+        "TIMEOUT: Your turn has exceeded the ${timeout_mins}-minute limit. Please wrap up immediately and write to $BP/$output_basename. In your summary, include: (1) What you accomplished and what remains incomplete. (2) Why this turn took so long — was it a long-running job (training, build), repeated failures, scope creep, or something else? (3) What you would do differently to get results faster next time (e.g. fewer epochs for a quick sanity check first, smaller data subset, checkpoint earlier, parallelize differently). Be honest — this reflection helps both agents plan better."
+
+    # Give the agent 180s to respond after the nudge
+    local nudge_ts
+    nudge_ts=$(now_epoch)
+    if wait_for_file_simple "$output_file" "$nudge_ts" 180 \
+        "$worker_pane" "$worker_label"; then
+        return 0
+    fi
+
+    # Still no output — write a timeout notice so the other agent has context
+    log_w "Agent $worker_label did not respond after timeout nudge — writing timeout notice"
+    cat > "$output_file" <<EOF
+## TIMEOUT NOTICE (auto-generated by bridge)
+
+Agent $worker_label's turn exceeded the ${timeout_mins}-minute limit and did not
+produce a summary after being nudged. The agent may be stuck or running an
+unexpectedly long job.
+
+**Reviewer**: Check Agent $worker_label's screen snapshot at $BP/live_$(lc "$worker_label").txt
+for context on what they were doing. Consider whether the approach needs to be
+restructured for faster iteration (e.g. smaller test runs before full training,
+checkpointing, or splitting the work differently).
+EOF
+    return 0  # non-fatal: let the round loop continue with the timeout notice
 }
 
 # Check if a review file indicates consensus (task is done).
@@ -1381,8 +1489,8 @@ cleanup() {
         log "Exiting. Killing tmux session '$SESSION'..."
         rm -f "$BRIDGE_DIR/bridge.pid"
         tmux kill-session -t "$SESSION" 2>/dev/null || true
-        # Kill any lingering child processes (stuck tmux send-keys, sleep, etc.)
-        kill 0 2>/dev/null || true
+        # Note: removed "kill 0" which was killing the entire process group,
+        # including the user's shell if duet.sh ran from within tmux.
     fi
     exit 0
 }
